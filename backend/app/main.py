@@ -1,7 +1,8 @@
 """ChartsMaze Clone - FastAPI Backend Application."""
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 import os
 import logging
@@ -12,6 +13,9 @@ from app.routers import stocks, rrg, breadth, sectors, scanners, journal
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+frontend_path = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "build")
+frontend_path = os.path.realpath(frontend_path)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -20,6 +24,7 @@ async def lifespan(app: FastAPI):
     os.makedirs("data", exist_ok=True)
     init_db()
     logger.info("Database initialized.")
+    logger.info(f"Frontend path: {frontend_path} (exists: {os.path.exists(frontend_path)})")
     yield
     logger.info("Shutting down ChartsMaze API...")
 
@@ -54,7 +59,21 @@ def health_check():
     return {"status": "ok", "app": "ChartsMaze Clone"}
 
 
-# Serve static frontend files in production
-frontend_path = os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "build")
+# Serve static frontend files with SPA fallback
 if os.path.exists(frontend_path):
-    app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
+    # Mount static assets (JS, CSS, images)
+    app.mount("/assets", StaticFiles(directory=os.path.join(frontend_path, "assets")), name="assets")
+
+    @app.get("/favicon.svg")
+    async def favicon():
+        return FileResponse(os.path.join(frontend_path, "favicon.svg"))
+
+    # SPA fallback: serve index.html for all non-API routes
+    @app.get("/{full_path:path}")
+    async def serve_spa(request: Request, full_path: str):
+        # Try to serve a static file first
+        file_path = os.path.join(frontend_path, full_path)
+        if full_path and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        # Otherwise return index.html for client-side routing
+        return FileResponse(os.path.join(frontend_path, "index.html"))
