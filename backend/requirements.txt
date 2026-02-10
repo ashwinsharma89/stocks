@@ -1,8 +1,10 @@
 fastapi
 uvicorn
 numpy
+pandas
 pydantic
 aiofiles
 python-multipart
 sqlalchemy
 httpx
+yfinance

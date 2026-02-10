@@ -1,23 +1,18 @@
-"""Yahoo Finance data client using httpx (no yfinance dependency).
+"""Yahoo Finance data client using yfinance library.
 
-This module fetches stock data directly from Yahoo Finance's API endpoints
-to avoid the yfinance/multitasking build dependency issues.
+Replaces the broken direct HTTP v8 API calls with the yfinance library,
+which handles crumb/cookie authentication automatically.
 """
-import httpx
+import yfinance as yf
 import pandas as pd
 import numpy as np
+import asyncio
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 import logging
-import json
 import time
 
 logger = logging.getLogger(__name__)
-
-BASE_URL = "https://query1.finance.yahoo.com"
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
 
 # In-memory cache
 _cache: Dict[str, dict] = {}
@@ -34,216 +29,261 @@ def _set_cache(key: str, value):
     _cache_time[key] = time.time()
 
 
-def _period_to_seconds(period: str) -> int:
-    """Convert period string to seconds for range calculation."""
-    mapping = {
-        "1d": 86400, "5d": 5 * 86400, "1mo": 30 * 86400,
-        "3mo": 90 * 86400, "6mo": 180 * 86400,
-        "1y": 365 * 86400, "2y": 730 * 86400, "5y": 1825 * 86400,
-    }
-    return mapping.get(period, 365 * 86400)
+def _fetch_chart_sync(symbol: str, period: str, interval: str) -> Dict:
+    """Synchronous yfinance chart fetch (runs in thread)."""
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, interval=interval, timeout=15)
 
+    if df.empty:
+        logger.warning(f"No chart data returned for {symbol} (period={period}, interval={interval})")
+        return {}
 
-def _interval_to_yahoo(interval: str) -> str:
-    """Map interval to Yahoo Finance API interval."""
-    mapping = {
-        "1m": "1m", "5m": "5m", "15m": "15m",
-        "1h": "1h", "1d": "1d", "1wk": "1wk", "1mo": "1mo",
+    ohlc = []
+    for idx, row in df.iterrows():
+        date_str = idx.strftime("%Y-%m-%d") if interval in ("1d", "1wk", "1mo") else idx.strftime("%Y-%m-%d %H:%M")
+        o = row.get("Open")
+        h = row.get("High")
+        l = row.get("Low")
+        c = row.get("Close")
+        v = row.get("Volume", 0)
+
+        if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
+            continue
+
+        ohlc.append({
+            "date": date_str,
+            "open": round(float(o), 2),
+            "high": round(float(h), 2),
+            "low": round(float(l), 2),
+            "close": round(float(c), 2),
+            "volume": int(v or 0),
+        })
+
+    if not ohlc:
+        logger.warning(f"All OHLC rows were NaN for {symbol}")
+        return {}
+
+    if all(d["close"] == 0 for d in ohlc):
+        logger.error(f"Data validation failed for {symbol}: all close prices are zero")
+        return {}
+
+    # Get metadata
+    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
+    meta = {
+        "currency": "INR",
+        "exchange": "NSE",
+        "name": clean_symbol,
+        "regularMarketPrice": ohlc[-1]["close"],
+        "previousClose": ohlc[-2]["close"] if len(ohlc) > 1 else ohlc[-1]["close"],
     }
-    return mapping.get(interval, "1d")
+
+    try:
+        fi = ticker.fast_info
+        meta["regularMarketPrice"] = getattr(fi, "last_price", None) or ohlc[-1]["close"]
+        meta["previousClose"] = getattr(fi, "previous_close", None) or meta["previousClose"]
+        meta["currency"] = getattr(fi, "currency", "INR") or "INR"
+        meta["exchange"] = getattr(fi, "exchange", "NSE") or "NSE"
+    except Exception:
+        pass
+
+    try:
+        info = ticker.info
+        meta["name"] = info.get("longName") or info.get("shortName") or clean_symbol
+    except Exception:
+        pass
+
+    return {
+        "symbol": symbol,
+        "meta": meta,
+        "ohlc": ohlc,
+    }
 
 
 async def fetch_chart_data(symbol: str, period: str = "1y", interval: str = "1d") -> Dict:
-    """Fetch OHLCV chart data from Yahoo Finance v8 API."""
+    """Fetch OHLCV chart data using yfinance."""
     cache_key = f"chart_{symbol}_{period}_{interval}"
     if _is_cached(cache_key):
         return _cache[cache_key]
 
     try:
-        range_val = period
-        url = f"{BASE_URL}/v8/finance/chart/{symbol}"
-        params = {
-            "range": range_val,
-            "interval": _interval_to_yahoo(interval),
-            "includePrePost": "false",
-        }
-
-        async with httpx.AsyncClient(timeout=15, headers=HEADERS) as client:
-            resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                logger.error(f"Yahoo API error {resp.status_code} for {symbol}")
-                return {}
-
-            data = resp.json()
-
-        result_data = data.get("chart", {}).get("result", [])
-        if not result_data:
-            return {}
-
-        result = result_data[0]
-        timestamps = result.get("timestamp", [])
-        indicators = result.get("indicators", {})
-        quotes = indicators.get("quote", [{}])[0]
-        meta = result.get("meta", {})
-
-        ohlc = []
-        for i, ts in enumerate(timestamps):
-            o = quotes.get("open", [None])[i]
-            h = quotes.get("high", [None])[i]
-            l = quotes.get("low", [None])[i]
-            c = quotes.get("close", [None])[i]
-            v = quotes.get("volume", [0])[i]
-
-            if o is None or h is None or l is None or c is None:
-                continue
-
-            dt = datetime.fromtimestamp(ts)
-            ohlc.append({
-                "date": dt.strftime("%Y-%m-%d"),
-                "open": round(float(o), 2),
-                "high": round(float(h), 2),
-                "low": round(float(l), 2),
-                "close": round(float(c), 2),
-                "volume": int(v or 0),
-            })
-
-        chart_result = {
-            "symbol": symbol,
-            "meta": {
-                "currency": meta.get("currency", "INR"),
-                "exchange": meta.get("exchangeName", ""),
-                "name": meta.get("longName", meta.get("shortName", symbol)),
-                "regularMarketPrice": meta.get("regularMarketPrice"),
-                "previousClose": meta.get("previousClose") or meta.get("chartPreviousClose"),
-            },
-            "ohlc": ohlc,
-        }
-
-        _set_cache(cache_key, chart_result)
-        return chart_result
-
+        result = await asyncio.to_thread(_fetch_chart_sync, symbol, period, interval)
+        if result:
+            _set_cache(cache_key, result)
+        return result
     except Exception as e:
         logger.error(f"Error fetching chart for {symbol}: {e}")
         return {}
 
 
+def _fetch_quote_sync(symbol: str) -> Dict:
+    """Synchronous yfinance quote fetch."""
+    ticker = yf.Ticker(symbol)
+
+    # Get recent history for price data
+    df = ticker.history(period="5d", interval="1d", timeout=15)
+    if df.empty:
+        logger.warning(f"No quote data for {symbol}")
+        return {}
+
+    last_row = df.iloc[-1]
+    price = round(float(last_row["Close"]), 2)
+    open_price = round(float(last_row["Open"]), 2)
+    high_price = round(float(last_row["High"]), 2)
+    low_price = round(float(last_row["Low"]), 2)
+    volume = int(last_row["Volume"])
+
+    if len(df) > 1:
+        prev_close = round(float(df.iloc[-2]["Close"]), 2)
+    else:
+        prev_close = price
+
+    if price == 0:
+        logger.warning(f"Zero price for {symbol}")
+        return {}
+
+    change = round(price - prev_close, 2)
+    change_pct = round((change / prev_close * 100), 2) if prev_close else 0
+
+    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
+    name = clean_symbol
+
+    # Try to get market cap from fast_info
+    market_cap = None
+    try:
+        fi = ticker.fast_info
+        market_cap = getattr(fi, "market_cap", None)
+        if market_cap:
+            market_cap = int(market_cap)
+    except Exception:
+        pass
+
+    # Try to get name from info
+    try:
+        info = ticker.info
+        name = info.get("longName") or info.get("shortName") or clean_symbol
+    except Exception:
+        pass
+
+    return {
+        "symbol": clean_symbol,
+        "name": name,
+        "price": price,
+        "change": change,
+        "change_percent": change_pct,
+        "volume": volume,
+        "market_cap": market_cap,
+        "prev_close": prev_close,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+    }
+
+
 async def fetch_quote(symbol: str) -> Dict:
-    """Fetch current quote data."""
+    """Fetch current quote data using yfinance."""
     cache_key = f"quote_{symbol}"
     if _is_cached(cache_key):
         return _cache[cache_key]
 
     try:
-        url = f"{BASE_URL}/v8/finance/chart/{symbol}"
-        params = {"range": "2d", "interval": "1d"}
-
-        async with httpx.AsyncClient(timeout=15, headers=HEADERS) as client:
-            resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                return {}
-            data = resp.json()
-
-        result_data = data.get("chart", {}).get("result", [])
-        if not result_data:
-            return {}
-
-        result = result_data[0]
-        meta = result.get("meta", {})
-        quotes = result.get("indicators", {}).get("quote", [{}])[0]
-        timestamps = result.get("timestamp", [])
-
-        close_list = [c for c in (quotes.get("close") or []) if c is not None]
-        volume_list = [v for v in (quotes.get("volume") or []) if v is not None]
-
-        if not close_list:
-            return {}
-
-        current_price = close_list[-1]
-        prev_close = close_list[-2] if len(close_list) > 1 else meta.get("chartPreviousClose", current_price)
-        change = current_price - (prev_close or current_price)
-        change_pct = (change / prev_close * 100) if prev_close else 0
-
-        quote_result = {
-            "symbol": symbol.replace(".NS", "").replace(".BO", ""),
-            "name": meta.get("longName", meta.get("shortName", symbol)),
-            "price": round(float(current_price), 2),
-            "change": round(float(change), 2),
-            "change_percent": round(float(change_pct), 2),
-            "volume": int(volume_list[-1]) if volume_list else 0,
-            "market_cap": None,
-            "prev_close": round(float(prev_close or 0), 2),
-            "open": round(float((quotes.get("open") or [0])[-1] or 0), 2),
-            "high": round(float((quotes.get("high") or [0])[-1] or 0), 2),
-            "low": round(float((quotes.get("low") or [0])[-1] or 0), 2),
-        }
-
-        _set_cache(cache_key, quote_result)
-        return quote_result
-
+        result = await asyncio.to_thread(_fetch_quote_sync, symbol)
+        if result:
+            _set_cache(cache_key, result)
+        return result
     except Exception as e:
         logger.error(f"Error fetching quote for {symbol}: {e}")
         return {}
 
 
 async def fetch_quotes_batch(symbols: List[str]) -> List[Dict]:
-    """Fetch quotes for multiple symbols."""
-    results = []
-    for sym in symbols:
-        q = await fetch_quote(sym)
-        if q:
-            results.append(q)
-    return results
+    """Fetch quotes for multiple symbols concurrently."""
+    tasks = [fetch_quote(sym) for sym in symbols]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    quotes = []
+    for r in results:
+        if isinstance(r, dict) and r:
+            quotes.append(r)
+        elif isinstance(r, Exception):
+            logger.error(f"Batch quote error: {r}")
+    return quotes
+
+
+def _fetch_info_sync(symbol: str) -> Dict:
+    """Synchronous yfinance info fetch."""
+    ticker = yf.Ticker(symbol)
+
+    df = ticker.history(period="1y", interval="1d", timeout=15)
+    if df.empty:
+        logger.warning(f"No history data for stock info: {symbol}")
+        return {}
+
+    ohlc = []
+    for idx, row in df.iterrows():
+        o = row.get("Open")
+        h = row.get("High")
+        l = row.get("Low")
+        c = row.get("Close")
+        v = row.get("Volume", 0)
+        if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
+            continue
+        ohlc.append({
+            "date": idx.strftime("%Y-%m-%d"),
+            "open": round(float(o), 2),
+            "high": round(float(h), 2),
+            "low": round(float(l), 2),
+            "close": round(float(c), 2),
+            "volume": int(v or 0),
+        })
+
+    if not ohlc:
+        return {}
+
+    highs = [d["high"] for d in ohlc]
+    lows = [d["low"] for d in ohlc]
+    volumes = [d["volume"] for d in ohlc]
+    week_52_high = max(highs) if highs else None
+    week_52_low = min(lows) if lows else None
+    avg_volume = int(sum(volumes) / len(volumes)) if volumes else None
+
+    clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
+
+    info_dict = {}
+    try:
+        info_dict = ticker.info or {}
+    except Exception as e:
+        logger.warning(f"Could not fetch info for {symbol}: {e}")
+
+    return {
+        "symbol": clean_symbol,
+        "name": info_dict.get("longName") or info_dict.get("shortName") or clean_symbol,
+        "sector": info_dict.get("sector"),
+        "industry": info_dict.get("industry"),
+        "market_cap": info_dict.get("marketCap"),
+        "pe_ratio": info_dict.get("trailingPE"),
+        "pb_ratio": info_dict.get("priceToBook"),
+        "dividend_yield": info_dict.get("dividendYield"),
+        "eps": info_dict.get("trailingEps"),
+        "book_value": info_dict.get("bookValue"),
+        "week_52_high": round(week_52_high, 2) if week_52_high else None,
+        "week_52_low": round(week_52_low, 2) if week_52_low else None,
+        "avg_volume": avg_volume,
+        "description": info_dict.get("longBusinessSummary", ""),
+        "ohlc": ohlc,
+    }
 
 
 async def fetch_stock_info(symbol: str) -> Dict:
-    """Fetch detailed stock info using quoteSummary."""
+    """Fetch detailed stock info using yfinance."""
     cache_key = f"info_{symbol}"
     if _is_cached(cache_key):
         return _cache[cache_key]
 
     try:
-        # Use v8 chart endpoint for basic info + history
-        chart_data = await fetch_chart_data(symbol, period="1y")
-        if not chart_data:
-            return {}
-
-        meta = chart_data.get("meta", {})
-        ohlc = chart_data.get("ohlc", [])
-
-        # Compute 52-week stats from historical data
-        if ohlc:
-            highs = [d["high"] for d in ohlc]
-            lows = [d["low"] for d in ohlc]
-            volumes = [d["volume"] for d in ohlc]
-            week_52_high = max(highs) if highs else None
-            week_52_low = min(lows) if lows else None
-            avg_volume = int(sum(volumes) / len(volumes)) if volumes else None
-        else:
-            week_52_high = week_52_low = avg_volume = None
-
-        clean_symbol = symbol.replace(".NS", "").replace(".BO", "")
-
-        info = {
-            "symbol": clean_symbol,
-            "name": meta.get("name", clean_symbol),
-            "sector": None,
-            "industry": None,
-            "market_cap": None,
-            "pe_ratio": None,
-            "pb_ratio": None,
-            "dividend_yield": None,
-            "eps": None,
-            "book_value": None,
-            "week_52_high": round(week_52_high, 2) if week_52_high else None,
-            "week_52_low": round(week_52_low, 2) if week_52_low else None,
-            "avg_volume": avg_volume,
-            "description": "",
-            "ohlc": ohlc,
-        }
-
-        _set_cache(cache_key, info)
-        return info
-
+        result = await asyncio.to_thread(_fetch_info_sync, symbol)
+        if result:
+            _set_cache(cache_key, result)
+        return result
     except Exception as e:
         logger.error(f"Error fetching info for {symbol}: {e}")
         return {}
